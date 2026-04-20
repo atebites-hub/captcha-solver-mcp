@@ -54,6 +54,16 @@ CLASSIFY_MAX_TOKENS = 1024   # yes/no with reasoning
 INSTRUCTION_MAX_TOKENS = 1024
 RAW_MAX_TOKENS = 8192        # hCaptcha JSON action plans, etc.
 
+# Per-call hard timeout. The openai SDK has no default timeout; a single
+# Z.AI-side hang will stall the whole solver indefinitely. With thinking on,
+# a legit classify_tile call finishes in ~3-8s (p95 7s per our profile),
+# so 30s leaves comfortable headroom but catches true hangs. On timeout we
+# retry via _with_retries (up to 3 attempts).
+PER_CALL_TIMEOUT_S = 30.0
+# Larger raw() / hCaptcha JSON calls may legitimately need more thinking; give
+# those a longer cap.
+RAW_CALL_TIMEOUT_S = 90.0
+
 
 @dataclass
 class VLMResult:
@@ -98,6 +108,7 @@ class VLMClient:
         max_tokens: int,
         temperature: float,
         thinking: bool = True,
+        timeout_s: float = PER_CALL_TIMEOUT_S,
     ) -> VLMResult:
         extra_headers = {
             "X-Title": ZAI_MCP_X_TITLE,
@@ -114,6 +125,7 @@ class VLMClient:
             temperature=temperature,
             extra_headers=extra_headers,
             extra_body=extra_body,
+            timeout=timeout_s,
         )
         if not getattr(resp, "choices", None):
             err_detail = getattr(resp, "error", None) or "empty choices"
@@ -163,11 +175,15 @@ class VLMClient:
         max_tokens: int,
         temperature: float = 0.1,
         thinking: bool = True,
+        timeout_s: float = PER_CALL_TIMEOUT_S,
     ) -> VLMResult:
         last_exc: Exception | None = None
         for attempt in range(3):
             try:
-                return await self._call_once(messages, max_tokens, temperature, thinking=thinking)
+                return await self._call_once(
+                    messages, max_tokens, temperature,
+                    thinking=thinking, timeout_s=timeout_s,
+                )
             except (RateLimitError, APIStatusError) as exc:
                 status = getattr(exc, "status_code", None)
                 last_exc = exc
@@ -175,10 +191,23 @@ class VLMClient:
                     "VLM call failed on attempt %d (status=%s): %s",
                     attempt + 1, status, exc,
                 )
-                # Only backoff/retry on 429/5xx
                 if not (isinstance(exc, RateLimitError) or (status and status >= 500)):
                     raise
                 await asyncio.sleep(min(2 ** attempt, 8))
+            except (asyncio.TimeoutError, Exception) as exc:
+                # openai SDK raises APITimeoutError (subclass of APIError) or
+                # httpx.ReadTimeout when timeout fires. Treat any timeout-ish
+                # error as retryable — re-raise on the last attempt.
+                if "timeout" in str(type(exc)).lower() or "timeout" in str(exc).lower():
+                    last_exc = exc
+                    logger.warning(
+                        "VLM call timed out on attempt %d (%.1fs): %s",
+                        attempt + 1, timeout_s, exc,
+                    )
+                    await asyncio.sleep(1.0)
+                    continue
+                # Not a timeout — let it bubble
+                raise
         raise RuntimeError(
             f"VLM call failed after 3 attempts (last: {last_exc})"
         ) from last_exc
@@ -242,6 +271,7 @@ class VLMClient:
         max_tokens: int = RAW_MAX_TOKENS,
         temperature: float = 0.1,
         thinking: bool = True,
+        timeout_s: float = RAW_CALL_TIMEOUT_S,
     ) -> VLMResult:
         """Escape hatch for solvers that need custom prompts (hCaptcha, etc.)."""
         content: list[dict[str, Any]] = [{"type": "text", "text": user_prompt}]
@@ -253,6 +283,7 @@ class VLMClient:
             max_tokens=max_tokens,
             temperature=temperature,
             thinking=thinking,
+            timeout_s=timeout_s,
         )
 
     async def json_response(
