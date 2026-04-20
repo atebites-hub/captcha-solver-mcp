@@ -120,7 +120,17 @@ class VLMClient:
             raise RuntimeError(
                 f"VLM returned no choices (model={self.model}): {err_detail}"
             )
-        msg = resp.choices[0].message
+        choice = resp.choices[0]
+        # Canary: log when max_tokens was hit — means reasoning truncated and
+        # we're budget-starved. Bump the relevant CLASSIFY/INSTRUCTION/RAW
+        # constant if we see this regularly.
+        if getattr(choice, "finish_reason", None) == "length":
+            logger.warning(
+                "finish_reason=length (max_tokens=%d reached, model=%s) — "
+                "reasoning truncated, consider raising budget",
+                max_tokens, self.model,
+            )
+        msg = choice.message
         # GLM thinking-mode puts the chain-of-thought in reasoning_content
         # and the final answer in content. If content is empty (reasoning
         # exhausted max_tokens), fall back to the last-sentence of reasoning
