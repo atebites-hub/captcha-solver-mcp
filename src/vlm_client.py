@@ -27,6 +27,18 @@ logger = logging.getLogger("captcha_solver.vlm")
 
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+ZAI_CODING_VISION_BASE_URL = "https://api.z.ai/api/paas/v4"
+# The Z.AI Vision Understanding feature (part of the Coding Plan's expanded
+# capabilities, counts against the 5-hour prompt pool — not billed separately)
+# unlocks on /paas/v4/chat/completions when the request presents this header.
+# Discovered by reverse-engineering @z_ai/mcp-server's chat-service.js.
+# Without this header the same request returns 1113 "Insufficient balance."
+ZAI_MCP_X_TITLE = "4.5V MCP Local"
+
+
+def _is_zai_model(model: str) -> bool:
+    """Z.AI model ids start with 'glm-' (e.g. glm-4.6v, glm-4.5v, glm-5v-turbo)."""
+    return model.lower().startswith("glm-")
 
 
 @dataclass
@@ -52,13 +64,24 @@ class VLMClient:
         self.fallback = fallback or os.environ.get(
             "CAPTCHA_SOLVER_MODEL_FALLBACK", "nvidia/nemotron-nano-12b-v2-vl"
         )
-        key = api_key or os.environ.get("OPENROUTER_API_KEY")
-        if not key:
+        # We maintain two clients — OpenRouter for generic models, and Z.AI's
+        # own /paas/v4 endpoint for GLM vision models (routed through the
+        # Coding-plan "Vision Understanding" pool via the X-Title header).
+        openrouter_key = api_key or os.environ.get("OPENROUTER_API_KEY")
+        zai_key = os.environ.get("GLM_API_KEY")
+        if not openrouter_key and not zai_key:
             raise RuntimeError(
-                "OPENROUTER_API_KEY not set — the captcha-solver container requires "
-                "an OpenRouter key. Add it to ~/.hermes/.env and restart the container."
+                "Neither OPENROUTER_API_KEY nor GLM_API_KEY set. "
+                "Add one to ~/.hermes/.env and restart the container."
             )
-        self.client = AsyncOpenAI(base_url=OPENROUTER_BASE_URL, api_key=key)
+        self.or_client = (
+            AsyncOpenAI(base_url=OPENROUTER_BASE_URL, api_key=openrouter_key)
+            if openrouter_key else None
+        )
+        self.zai_client = (
+            AsyncOpenAI(base_url=ZAI_CODING_VISION_BASE_URL, api_key=zai_key)
+            if zai_key else None
+        )
 
     @staticmethod
     def _inline_image(image_bytes: bytes, mime: str = "image/png") -> dict[str, Any]:
@@ -75,18 +98,56 @@ class VLMClient:
         max_tokens: int,
         temperature: float,
     ) -> VLMResult:
-        resp = await self.client.chat.completions.create(
+        # Pick the right client + extra headers based on model family.
+        # GLM vision models (glm-4.6v etc.) route through Z.AI's /paas/v4 with
+        # the MCP-unlock X-Title header, billed against the Coding-plan pool.
+        # Everything else routes through OpenRouter.
+        if _is_zai_model(model):
+            if self.zai_client is None:
+                raise RuntimeError(
+                    f"model {model!r} requires GLM_API_KEY in env but none is set"
+                )
+            client = self.zai_client
+            extra_headers = {
+                "X-Title": ZAI_MCP_X_TITLE,
+                "Accept-Language": "en-US,en",
+            }
+            # GLM defaults to thinking-mode on vision models, which eats the
+            # whole output budget on simple yes/no classifications and leaves
+            # only half-formed reasoning in the response. Disable by default;
+            # solvers that want thinking can call raw() with the appropriate
+            # kwargs (see docstrings).
+            extra_body: dict[str, Any] = {"thinking": {"type": "disabled"}}
+        else:
+            if self.or_client is None:
+                raise RuntimeError(
+                    f"model {model!r} requires OPENROUTER_API_KEY but none is set"
+                )
+            client = self.or_client
+            extra_headers = {
+                "HTTP-Referer": "https://github.com/atebites-hub/silverbullet-vault",
+                "X-Title": "hermes-captcha-solver",
+            }
+            extra_body = {}
+
+        resp = await client.chat.completions.create(
             model=model,
             messages=messages,
             max_tokens=max_tokens,
             temperature=temperature,
-            # Attribution for OpenRouter analytics; optional but polite.
-            extra_headers={
-                "HTTP-Referer": "https://github.com/atebites-hub/silverbullet-vault",
-                "X-Title": "hermes-captcha-solver",
-            },
+            extra_headers=extra_headers,
+            extra_body=extra_body,
         )
-        content = (resp.choices[0].message.content or "").strip()
+        # Defensive: OpenRouter sometimes returns 200 with null choices on
+        # content-policy blocks or upstream 5xx; raising here flows into the
+        # retry layer instead of crashing with TypeError.
+        if not getattr(resp, "choices", None):
+            err_detail = getattr(resp, "error", None) or "empty choices"
+            raise RuntimeError(f"VLM returned no choices (model={model}): {err_detail}")
+        # GLM thinking-mode sometimes puts content in reasoning_content instead
+        # of content; try both.
+        msg = resp.choices[0].message
+        content = (msg.content or getattr(msg, "reasoning_content", "") or "").strip()
         usage = resp.usage
         return VLMResult(
             text=content,
