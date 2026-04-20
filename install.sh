@@ -26,22 +26,26 @@ set -a
 source "$ENVFILE"
 set +a
 
-: "${OPENROUTER_API_KEY:?must set OPENROUTER_API_KEY in $ENVFILE (https://openrouter.ai/settings/keys)}"
-: "${CAPTCHA_SOLVER_MODEL:?must set CAPTCHA_SOLVER_MODEL in $ENVFILE (e.g. google/gemma-4-31b-it)}"
+: "${GLM_API_KEY:?must set GLM_API_KEY in $ENVFILE (your Z.AI Coding plan key)}"
+: "${CAPTCHA_SOLVER_MODEL:=glm-5v-turbo}"
+# Must be a GLM model — captcha-solver only supports Z.AI Coding-plan vision
+case "$CAPTCHA_SOLVER_MODEL" in
+  glm-*) ;;
+  *) echo "FATAL: CAPTCHA_SOLVER_MODEL must start with 'glm-' (got '$CAPTCHA_SOLVER_MODEL'). OpenRouter support was removed — this solver is Z.AI-only now." >&2; exit 1 ;;
+esac
 
-# ── Verify model is live on OpenRouter ─────────────────────────────────
-echo "[captcha-solver] verifying model '$CAPTCHA_SOLVER_MODEL' on OpenRouter..."
-if command -v jq >/dev/null; then
-  if ! curl -sfH "Authorization: Bearer $OPENROUTER_API_KEY" \
-      "https://openrouter.ai/api/v1/models" \
-      | jq -e ".data[] | select(.id == \"$CAPTCHA_SOLVER_MODEL\")" >/dev/null; then
-    echo "FATAL: model '$CAPTCHA_SOLVER_MODEL' not available on OpenRouter." >&2
-    echo "Check https://openrouter.ai/models and update CAPTCHA_SOLVER_MODEL in $ENVFILE." >&2
+# ── Smoke-test the Coding-plan Vision Understanding endpoint ───────────
+echo "[captcha-solver] smoke-testing Z.AI /paas/v4 + X-Title unlock..."
+RESP=$(curl -sf --max-time 15 -X POST "https://api.z.ai/api/paas/v4/chat/completions" \
+  -H "Authorization: Bearer $GLM_API_KEY" \
+  -H "Content-Type: application/json" \
+  -H "X-Title: 4.5V MCP Local" \
+  -d "{\"model\":\"$CAPTCHA_SOLVER_MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}],\"max_tokens\":5,\"thinking\":{\"type\":\"disabled\"}}" 2>&1) || {
+    echo "FATAL: smoke test of Z.AI /paas/v4 with X-Title hack failed." >&2
+    echo "Response: $RESP" >&2
+    echo "Check GLM_API_KEY is a valid Z.AI Coding plan key." >&2
     exit 1
-  fi
-else
-  echo "[captcha-solver] jq not installed; skipping model availability check"
-fi
+  }
 
 # ── Docker build + up ──────────────────────────────────────────────────
 echo "[captcha-solver] docker compose up -d --build"

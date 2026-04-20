@@ -1,13 +1,20 @@
-"""OpenAI-compatible vision client backed by OpenRouter.
+"""Vision-LLM client backed by Z.AI's Coding-plan Vision Understanding pool.
 
-Every solver that needs VLM classification/reasoning goes through here. Primary
-model is ``CAPTCHA_SOLVER_MODEL`` from env; on rate-limit (429) or 5xx we retry
-once against ``CAPTCHA_SOLVER_MODEL_FALLBACK``.
+All VLM calls go to ``https://api.z.ai/api/paas/v4/chat/completions`` with the
+magic ``X-Title: 4.5V MCP Local`` header, which routes billing through the
+Coding plan's 5-hour prompt pool instead of the General API wallet. This
+header was reverse-engineered from @z_ai/mcp-server's chat-service.js and
+is what unlocks ``glm-5v-turbo`` and ``glm-4.6v`` on Coding-plan-only keys
+(without it, direct calls return ``1113 Insufficient balance``).
 
-Images are passed in as raw bytes and inlined as base64 data URLs. The OpenAI
-Python SDK auto-reads ``OPENAI_BASE_URL`` + ``OPENAI_API_KEY`` at client
-construction, but we pass them explicitly so env-var changes between calls are
-picked up on the next instantiation (useful when rotating OpenRouter keys).
+Only ``GLM_API_KEY`` is required. No OpenRouter fallback — we rely on the
+single Z.AI subscription to avoid accidental cross-billing.
+
+Thinking mode is ENABLED by default. Each solver method sets a generous
+``max_tokens`` so reasoning has room to complete before emitting the final
+answer. On ``classify_tile`` (yes/no) we accept content after the internal
+``</thinking>`` split; on ``extract_instruction`` and ``raw`` we take the
+final content the same way.
 """
 
 from __future__ import annotations
@@ -26,7 +33,6 @@ from openai import APIStatusError, RateLimitError
 logger = logging.getLogger("captcha_solver.vlm")
 
 
-OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 ZAI_CODING_VISION_BASE_URL = "https://api.z.ai/api/paas/v4"
 # The Z.AI Vision Understanding feature (part of the Coding Plan's expanded
 # capabilities, counts against the 5-hour prompt pool — not billed separately)
@@ -35,52 +41,47 @@ ZAI_CODING_VISION_BASE_URL = "https://api.z.ai/api/paas/v4"
 # Without this header the same request returns 1113 "Insufficient balance."
 ZAI_MCP_X_TITLE = "4.5V MCP Local"
 
+# Default primary model. glm-5v-turbo is Z.AI's flagship vision model; it
+# handles reCAPTCHA 4x4 hard mode, hCaptcha spatial-reasoning, and OCR tasks
+# that Gemma/smaller models stumble on.
+DEFAULT_MODEL = "glm-5v-turbo"
 
-def _is_zai_model(model: str) -> bool:
-    """Z.AI model ids start with 'glm-' (e.g. glm-4.6v, glm-4.5v, glm-5v-turbo)."""
-    return model.lower().startswith("glm-")
+# Token budgets — generous enough to let thinking complete before the final
+# answer. GLM reasoning tokens are separate from content tokens in the
+# response, but both share max_tokens. Sized so reasoning + a ~80-char answer
+# both fit.
+CLASSIFY_MAX_TOKENS = 1024   # yes/no with reasoning
+INSTRUCTION_MAX_TOKENS = 1024
+RAW_MAX_TOKENS = 8192        # hCaptcha JSON action plans, etc.
 
 
 @dataclass
 class VLMResult:
-    text: str
+    text: str                  # final content (post-reasoning if thinking was on)
+    reasoning: str             # raw reasoning trace, for debugging
     model_used: str
     prompt_tokens: int
     completion_tokens: int
+    reasoning_tokens: int
 
 
 class VLMClient:
-    """Thin wrapper around AsyncOpenAI with primary/fallback and retry."""
+    """Z.AI-only VLM client with thinking enabled + Coding-plan billing."""
 
     def __init__(
         self,
         primary: str | None = None,
-        fallback: str | None = None,
         api_key: str | None = None,
     ):
-        self.primary = primary or os.environ.get(
-            "CAPTCHA_SOLVER_MODEL", "google/gemma-4-31b-it"
-        )
-        self.fallback = fallback or os.environ.get(
-            "CAPTCHA_SOLVER_MODEL_FALLBACK", "nvidia/nemotron-nano-12b-v2-vl"
-        )
-        # We maintain two clients — OpenRouter for generic models, and Z.AI's
-        # own /paas/v4 endpoint for GLM vision models (routed through the
-        # Coding-plan "Vision Understanding" pool via the X-Title header).
-        openrouter_key = api_key or os.environ.get("OPENROUTER_API_KEY")
-        zai_key = os.environ.get("GLM_API_KEY")
-        if not openrouter_key and not zai_key:
+        self.model = primary or os.environ.get("CAPTCHA_SOLVER_MODEL", DEFAULT_MODEL)
+        key = api_key or os.environ.get("GLM_API_KEY")
+        if not key:
             raise RuntimeError(
-                "Neither OPENROUTER_API_KEY nor GLM_API_KEY set. "
-                "Add one to ~/.hermes/.env and restart the container."
+                "GLM_API_KEY not set. Add it to ~/.hermes/.env (shared with "
+                "main Hermes Coding-plan config) and restart the container."
             )
-        self.or_client = (
-            AsyncOpenAI(base_url=OPENROUTER_BASE_URL, api_key=openrouter_key)
-            if openrouter_key else None
-        )
-        self.zai_client = (
-            AsyncOpenAI(base_url=ZAI_CODING_VISION_BASE_URL, api_key=zai_key)
-            if zai_key else None
+        self.client = AsyncOpenAI(
+            base_url=ZAI_CODING_VISION_BASE_URL, api_key=key
         )
 
     @staticmethod
@@ -93,89 +94,78 @@ class VLMClient:
 
     async def _call_once(
         self,
-        model: str,
         messages: list[dict[str, Any]],
         max_tokens: int,
         temperature: float,
+        thinking: bool = True,
     ) -> VLMResult:
-        # Pick the right client + extra headers based on model family.
-        # GLM vision models (glm-4.6v etc.) route through Z.AI's /paas/v4 with
-        # the MCP-unlock X-Title header, billed against the Coding-plan pool.
-        # Everything else routes through OpenRouter.
-        if _is_zai_model(model):
-            if self.zai_client is None:
-                raise RuntimeError(
-                    f"model {model!r} requires GLM_API_KEY in env but none is set"
-                )
-            client = self.zai_client
-            extra_headers = {
-                "X-Title": ZAI_MCP_X_TITLE,
-                "Accept-Language": "en-US,en",
-            }
-            # GLM defaults to thinking-mode on vision models, which eats the
-            # whole output budget on simple yes/no classifications and leaves
-            # only half-formed reasoning in the response. Disable by default;
-            # solvers that want thinking can call raw() with the appropriate
-            # kwargs (see docstrings).
-            extra_body: dict[str, Any] = {"thinking": {"type": "disabled"}}
-        else:
-            if self.or_client is None:
-                raise RuntimeError(
-                    f"model {model!r} requires OPENROUTER_API_KEY but none is set"
-                )
-            client = self.or_client
-            extra_headers = {
-                "HTTP-Referer": "https://github.com/atebites-hub/silverbullet-vault",
-                "X-Title": "hermes-captcha-solver",
-            }
-            extra_body = {}
+        extra_headers = {
+            "X-Title": ZAI_MCP_X_TITLE,
+            "Accept-Language": "en-US,en",
+        }
+        extra_body: dict[str, Any] = {
+            "thinking": {"type": "enabled" if thinking else "disabled"},
+        }
 
-        resp = await client.chat.completions.create(
-            model=model,
+        resp = await self.client.chat.completions.create(
+            model=self.model,
             messages=messages,
             max_tokens=max_tokens,
             temperature=temperature,
             extra_headers=extra_headers,
             extra_body=extra_body,
         )
-        # Defensive: OpenRouter sometimes returns 200 with null choices on
-        # content-policy blocks or upstream 5xx; raising here flows into the
-        # retry layer instead of crashing with TypeError.
         if not getattr(resp, "choices", None):
             err_detail = getattr(resp, "error", None) or "empty choices"
-            raise RuntimeError(f"VLM returned no choices (model={model}): {err_detail}")
-        # GLM thinking-mode sometimes puts content in reasoning_content instead
-        # of content; try both.
+            raise RuntimeError(
+                f"VLM returned no choices (model={self.model}): {err_detail}"
+            )
         msg = resp.choices[0].message
-        content = (msg.content or getattr(msg, "reasoning_content", "") or "").strip()
+        # GLM thinking-mode puts the chain-of-thought in reasoning_content
+        # and the final answer in content. If content is empty (reasoning
+        # exhausted max_tokens), fall back to the last-sentence of reasoning
+        # as a best-effort extract.
+        reasoning = getattr(msg, "reasoning_content", "") or ""
+        content = (msg.content or "").strip()
+        if not content and reasoning:
+            # Pull the last non-empty line of reasoning as the probable answer.
+            # This is a fallback; usually means max_tokens was too tight.
+            tail = [line.strip() for line in reasoning.strip().splitlines() if line.strip()]
+            content = tail[-1] if tail else ""
         usage = resp.usage
         return VLMResult(
             text=content,
-            model_used=model,
+            reasoning=reasoning,
+            model_used=self.model,
             prompt_tokens=getattr(usage, "prompt_tokens", 0) if usage else 0,
             completion_tokens=getattr(usage, "completion_tokens", 0) if usage else 0,
+            reasoning_tokens=(
+                getattr(usage.completion_tokens_details, "reasoning_tokens", 0)
+                if usage and getattr(usage, "completion_tokens_details", None)
+                else 0
+            ),
         )
 
     async def _with_retries(
         self,
         messages: list[dict[str, Any]],
         *,
-        max_tokens: int = 512,
+        max_tokens: int,
         temperature: float = 0.1,
+        thinking: bool = True,
     ) -> VLMResult:
         last_exc: Exception | None = None
-        for attempt, model in enumerate([self.primary, self.fallback, self.primary]):
+        for attempt in range(3):
             try:
-                return await self._call_once(model, messages, max_tokens, temperature)
+                return await self._call_once(messages, max_tokens, temperature, thinking=thinking)
             except (RateLimitError, APIStatusError) as exc:
                 status = getattr(exc, "status_code", None)
                 last_exc = exc
                 logger.warning(
-                    "VLM call failed on attempt %d (model=%s, status=%s): %s",
-                    attempt + 1, model, status, exc,
+                    "VLM call failed on attempt %d (status=%s): %s",
+                    attempt + 1, status, exc,
                 )
-                # Only backoff/retry for 429/5xx; 4xx other than rate-limit
-                # is a programming error, not worth retrying.
+                # Only backoff/retry on 429/5xx
                 if not (isinstance(exc, RateLimitError) or (status and status >= 500)):
                     raise
                 await asyncio.sleep(min(2 ** attempt, 8))
@@ -186,16 +176,13 @@ class VLMClient:
     async def classify_tile(
         self, image_bytes: bytes, target: str, *, instruction: str | None = None
     ) -> bool:
-        """Ask: does this tile contain `target`?  Returns True/False.
-
-        `target` comes from the CAPTCHA instruction bar (e.g. "crosswalks",
-        "bicycles"). `instruction` is the full text if you want richer context.
-        """
+        """Ask: does this tile contain `target`?  Returns True/False."""
         prompt = (
             f'You are classifying a CAPTCHA tile. Does this image contain a '
             f'{target}? '
             f'{instruction or ""} '
-            'Reply with ONLY "YES" or "NO". No other text.'
+            'Think carefully, then finish with a single line containing '
+            'ONLY "YES" or "NO".'
         ).strip()
         messages = [
             {
@@ -206,23 +193,20 @@ class VLMClient:
                 ],
             }
         ]
-        result = await self._with_retries(messages, max_tokens=8, temperature=0.0)
+        result = await self._with_retries(
+            messages, max_tokens=CLASSIFY_MAX_TOKENS, temperature=0.0, thinking=True,
+        )
         answer = result.text.strip().upper()
-        # Be lenient: some models wrap in quotes or add punctuation.
         return answer.startswith("YES") or answer == "Y"
 
     async def extract_instruction(self, image_bytes: bytes) -> str:
-        """Read the instruction bar of a CAPTCHA challenge.
-
-        Returns the target object name(s) in lowercase, e.g. "crosswalks",
-        "bicycles", "fire hydrants". Empty string if unreadable.
-        """
+        """Read the instruction bar of a CAPTCHA challenge."""
         prompt = (
             "This is the top of a reCAPTCHA/hCaptcha challenge. The instruction "
             "text usually reads 'Select all images with X' or 'Click all images "
-            "containing X'. Return ONLY the value of X (the target object), in "
-            "lowercase, no punctuation. If you cannot read it, return an empty "
-            "string. Example output: crosswalks"
+            "containing X'. Reason about what you see, then finish with a single "
+            "line containing ONLY the value of X (the target object), in "
+            "lowercase, no punctuation. Example final line: crosswalks"
         )
         messages = [
             {
@@ -233,23 +217,33 @@ class VLMClient:
                 ],
             }
         ]
-        result = await self._with_retries(messages, max_tokens=32, temperature=0.0)
-        return result.text.strip().lower().strip(".,!?\"'")
+        result = await self._with_retries(
+            messages, max_tokens=INSTRUCTION_MAX_TOKENS, temperature=0.0, thinking=True,
+        )
+        # Final line after any reasoning text — just normalize.
+        last_line = result.text.strip().splitlines()[-1] if result.text else ""
+        return last_line.strip().lower().strip(".,!?\"'")
 
     async def raw(
         self,
         user_prompt: str,
         images: Iterable[bytes] = (),
         *,
-        max_tokens: int = 1024,
+        max_tokens: int = RAW_MAX_TOKENS,
         temperature: float = 0.1,
+        thinking: bool = True,
     ) -> VLMResult:
-        """Escape hatch for solvers that need custom prompts (hCaptcha Enterprise)."""
+        """Escape hatch for solvers that need custom prompts (hCaptcha, etc.)."""
         content: list[dict[str, Any]] = [{"type": "text", "text": user_prompt}]
         for img in images:
             content.append(self._inline_image(img))
         messages = [{"role": "user", "content": content}]
-        return await self._with_retries(messages, max_tokens=max_tokens, temperature=temperature)
+        return await self._with_retries(
+            messages,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            thinking=thinking,
+        )
 
     async def json_response(
         self,
@@ -257,27 +251,26 @@ class VLMClient:
         schema_hint: str,
         images: Iterable[bytes] = (),
         *,
-        max_tokens: int = 512,
+        max_tokens: int = RAW_MAX_TOKENS,
     ) -> dict[str, Any]:
-        """Ask for a JSON response. `schema_hint` is a description of the
-        expected shape appended to the prompt (most OpenRouter providers
-        don't honor `response_format.json_schema` reliably)."""
+        """Ask for a JSON response; parses + returns the dict."""
         prompt = (
             f"{user_prompt}\n\n"
-            f"Respond with ONLY a JSON object matching this shape:\n{schema_hint}\n"
-            "Do not include markdown fences or any explanatory text."
+            f"After reasoning, finish with ONLY a JSON object matching this "
+            f"shape:\n{schema_hint}\n"
+            "Do not include markdown fences around the final JSON."
         )
         result = await self.raw(prompt, images, max_tokens=max_tokens, temperature=0.0)
-        text = result.text
-        # Strip common wrapping markdown if the model ignores the instruction.
-        for fence in ("```json", "```"):
-            if fence in text:
-                text = text.split(fence, 1)[-1]
-        text = text.strip("` \n\t")
-        if text.endswith("```"):
-            text = text[:-3].strip()
+        text = result.text or ""
+        # Try to locate the last {...} block in the response.
+        first_brace = text.find("{")
+        last_brace = text.rfind("}")
+        if first_brace == -1 or last_brace <= first_brace:
+            logger.error("no JSON object in VLM response: %r", text[:500])
+            raise RuntimeError("VLM returned no JSON object")
+        candidate = text[first_brace : last_brace + 1]
         try:
-            return json.loads(text)
+            return json.loads(candidate)
         except json.JSONDecodeError as exc:
-            logger.error("VLM JSON parse failed; raw=%r", result.text)
+            logger.error("VLM JSON parse failed; raw=%r", text[:500])
             raise RuntimeError(f"VLM returned non-JSON: {exc}") from exc

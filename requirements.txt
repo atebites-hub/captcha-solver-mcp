@@ -2,10 +2,10 @@
 fastapi>=0.115
 uvicorn[standard]>=0.32
 
-# HTTP client (for MCP shim → FastAPI proxy, and for OpenRouter fallbacks)
+# HTTP client (MCP shim → FastAPI proxy)
 httpx>=0.28
 
-# OpenAI-compatible client (used to reach OpenRouter)
+# OpenAI-compatible client (used against Z.AI /paas/v4 with X-Title hack)
 openai>=1.50
 
 # Data validation
@@ -14,12 +14,11 @@ pydantic>=2.9
 # Stealth browser
 camoufox[geoip]>=0.4
 
-# MCP SDK (host-side shim + any future in-container MCP use)
+# MCP SDK (host-side shim)
 mcp>=1.2
 
-# Image handling
+# Image handling (tile screenshots, upscaling for better VLM accuracy)
 Pillow>=10.4
 
-# Optional YAML reading (install.sh does the merging via hermes venv, but
-# handy for server-side config in future)
+# YAML reading for config files
 PyYAML>=6.0
