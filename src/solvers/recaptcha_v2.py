@@ -211,10 +211,16 @@ async def solve(site_url: str, site_key: str, timeout_s: int) -> str:
                             logger.warning("dyn tile %d click failed: %s", idx, exc)
                     clicked.update(dyn_new)
 
-            # Click Verify. After click, if button becomes disabled → passed.
+            # Click Verify. Verify button is inside the bframe and on tall
+            # 4x4 grids can scroll below the iframe's internal viewport —
+            # Playwright's auto-scroll doesn't always reach inside iframes.
+            # Scroll it in first, then JS-dispatch the click (bypasses
+            # viewport-stability checks which fail on iframe-nested elements).
             try:
                 verify = bframe.locator("#recaptcha-verify-button")
-                await verify.click(timeout=5000)
+                await verify.wait_for(state="visible", timeout=5000)
+                await verify.scroll_into_view_if_needed(timeout=3000)
+                await verify.evaluate("el => el.click()")
                 await page.wait_for_timeout(1500)
                 # "disabled" attr true → passed; otherwise new challenge shown
                 disabled = await verify.get_attribute("disabled")
