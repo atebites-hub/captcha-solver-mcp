@@ -1,0 +1,26 @@
+services:
+  captcha-solver:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: captcha-solver-mcp:latest
+    container_name: captcha-solver
+    ports:
+    - "127.0.0.1:8899:8899"
+    env_file:
+    - /home/admin/.hermes/.env
+    environment:
+      PYTHONPATH: /app
+    volumes:
+    - camoufox-cache:/root/.cache/camoufox
+    restart: unless-stopped
+    mem_limit: 2g
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8899/health', timeout=2).read()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+volumes:
+  camoufox-cache: {}

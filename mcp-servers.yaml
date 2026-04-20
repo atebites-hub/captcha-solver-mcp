@@ -1,0 +1,6 @@
+captcha-solver:
+  command: /home/admin/.hermes/hermes-agent/venv/bin/python3
+  args:
+  - /home/admin/.hermes/plugins/captcha-solver-mcp/src/mcp_shim.py
+  env:
+    CAPTCHA_SOLVER_URL: http://127.0.0.1:8899
