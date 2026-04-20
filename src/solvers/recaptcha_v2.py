@@ -34,11 +34,12 @@ from src.vlm_client import VLMClient
 
 logger = logging.getLogger("captcha_solver.recaptcha_v2")
 
-MAX_CHALLENGE_ATTEMPTS = 10
-# After clicking matches, re-screenshot + re-classify this many times to
-# handle reCAPTCHA v2's "dynamic 4x4" hard mode where new target tiles fade
-# in as you click correct ones.
-MAX_DYNAMIC_ROUNDS = 4
+MAX_CHALLENGE_ATTEMPTS = 8
+# After clicking matches, re-screenshot + re-classify just the clicked cells
+# this many times to handle reCAPTCHA v2's "dynamic 4x4" hard mode where new
+# target tiles fade in where you click. (We only re-check the CLICKED tiles
+# not the whole grid — untouched tiles don't change.)
+MAX_DYNAMIC_ROUNDS = 3
 CLICK_JITTER_MIN = 0.2
 CLICK_JITTER_MAX = 0.5
 
@@ -180,15 +181,15 @@ async def solve(site_url: str, site_key: str, timeout_s: int) -> str:
             clicked.update(new_clicks)
 
             # Dynamic 4x4 mode: Google fades NEW target tiles in where we
-            # just clicked. Keep re-screenshotting + re-classifying those
-            # newly-painted cells until no more matches appear.
-            if n_tiles >= 16 and new_clicks:
+            # just clicked. We only need to re-classify the CLICKED cells —
+            # untouched tiles don't change. This keeps the dynamic phase
+            # at O(clicked) not O(16) per round.
+            recent_clicks = list(new_clicks)  # shrinks each round
+            if n_tiles >= 16 and recent_clicks:
                 for dyn_round in range(MAX_DYNAMIC_ROUNDS):
-                    # Wait for fade-in to stabilize (pixel-hash-based), not
-                    # a fixed timer. Only watch the tiles we just clicked.
-                    await _wait_fade_stable(tiles_locator, new_clicks)
+                    await _wait_fade_stable(tiles_locator, recent_clicks)
                     dyn_shots = await asyncio.gather(*[
-                        _safe_screenshot(tiles_locator.nth(i)) for i in range(n_tiles)
+                        _safe_screenshot(tiles_locator.nth(i)) for i in recent_clicks
                     ])
                     dyn_shots = [_upscale(png) if png else None for png in dyn_shots]
                     dyn_results = await asyncio.gather(*[
@@ -196,13 +197,16 @@ async def solve(site_url: str, site_key: str, timeout_s: int) -> str:
                         if png else _const(False)
                         for png in dyn_shots
                     ])
-                    dyn_matches = {i for i, yes in enumerate(dyn_results) if yes}
-                    # Only click tiles NOT already clicked
+                    # Map results back to the subset of indices we asked about
+                    dyn_matches = {
+                        idx for idx, yes in zip(recent_clicks, dyn_results) if yes
+                    }
                     dyn_new = sorted(dyn_matches - clicked)
                     if not dyn_new:
                         logger.info("dynamic round %d: no new matches — done", dyn_round + 1)
                         break
                     logger.info("dynamic round %d: clicking %s", dyn_round + 1, dyn_new)
+                    recent_clicks = dyn_new  # next round only re-classifies these
                     for idx in dyn_new:
                         try:
                             await tiles_locator.nth(idx).click()
