@@ -1,22 +1,48 @@
-"""FastAPI dispatcher for the captcha-solver container.
+"""FastAPI tile classifier for the captcha-solver container.
 
-Exposes POST /solve with {type, site_url, site_key?} and routes to the right
-solver module under src/solvers/. Each solver returns either a token (reCAPTCHA,
-hCaptcha, Turnstile) or a cookies+UA bundle (CF Managed Challenge).
+v0.2.0 — classifier-only. The container no longer owns a browser; Hermes
+drives its own Camofox session and just hands us tile images. We return
+which indices match the target.
 
-Runs on 127.0.0.1:8899 inside the container; the host-side MCP shim
-(src/mcp_shim.py) proxies MCP tool calls to here.
+Endpoints
+---------
+POST /solve_tiles
+    Input:
+        target: str            # e.g. "crosswalks", "buses", "traffic lights"
+        tile_images: [str]     # base64-encoded PNG bytes, one per tile
+        instruction_image: str (optional)
+            A base64 PNG of the instruction bar — if omitted, `target`
+            is used verbatim. When present we re-read the instruction
+            (reCAPTCHA sometimes rewords it mid-challenge) and override.
+        threshold: str = "strict"
+            Currently unused; reserved for future tunable behaviour.
+
+    Output:
+        {
+          "match_indices": [int],   # 0-based indices into tile_images
+          "target": str,            # the target we actually classified against
+          "model_used": str,
+          "per_tile_latency_ms": [int],
+          "total_elapsed_ms": int,
+        }
+
+GET /health
+    {"ok": true, "version": "0.2.0", "model": "<configured VLM>"}
 """
 
 from __future__ import annotations
 
+import asyncio
+import base64
 import logging
+import os
 import time
-from typing import Any, Literal
+from typing import Any
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
+
+from src.vlm_client import VLMClient
 
 logger = logging.getLogger("captcha_solver")
 logging.basicConfig(
@@ -24,100 +50,99 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
 )
 
-app = FastAPI(title="captcha-solver-mcp", version="0.1.0")
+app = FastAPI(title="captcha-solver-mcp", version="0.2.0")
+
+_vlm: VLMClient | None = None
 
 
-CaptchaType = Literal[
-    "recaptcha_v2",
-    "recaptcha_v3",
-    "hcaptcha",
-    "turnstile",
-    "cf_managed",
-]
+def get_vlm() -> VLMClient:
+    global _vlm
+    if _vlm is None:
+        _vlm = VLMClient()
+    return _vlm
 
 
-class SolveRequest(BaseModel):
-    type: CaptchaType = Field(..., description="CAPTCHA variety to solve")
-    site_url: str = Field(..., description="Full URL of the page hosting the CAPTCHA")
-    site_key: str | None = Field(
-        None,
-        description=(
-            "Public site-key / data-sitekey. Required for reCAPTCHA + hCaptcha + "
-            "Turnstile; ignored for cf_managed (detected from the page)."
-        ),
+class SolveTilesRequest(BaseModel):
+    target: str = Field(..., description="What to look for in each tile (e.g. 'crosswalks').")
+    tile_images: list[str] = Field(
+        ..., min_length=1, max_length=64,
+        description="Base64-encoded PNG bytes, one per tile. Order matters: the "
+                    "returned indices are offsets into this list.",
     )
-    # Optional tuning knobs — not required for v0.1.0, reserved for future use.
-    timeout_s: int = Field(180, ge=10, le=600)
+    instruction_image: str | None = Field(
+        None,
+        description="Optional base64 PNG of the CAPTCHA instruction bar. When "
+                    "supplied, overrides `target` with whatever the VLM reads.",
+    )
 
 
-class TokenResponse(BaseModel):
-    token: str
-    model_used: str | None = None
-    elapsed_ms: int
-
-
-class CookieBundleResponse(BaseModel):
-    cookies: dict[str, str]
-    user_agent: str
-    elapsed_ms: int
+class SolveTilesResponse(BaseModel):
+    match_indices: list[int]
+    target: str
+    model_used: str
+    per_tile_latency_ms: list[int]
+    total_elapsed_ms: int
 
 
 @app.get("/health")
 async def health() -> dict[str, Any]:
-    return {"ok": True, "version": app.version}
+    return {
+        "ok": True,
+        "version": app.version,
+        "model": os.environ.get("CAPTCHA_SOLVER_MODEL", "glm-5v-turbo"),
+    }
 
 
-@app.post("/solve")
-async def solve(req: SolveRequest) -> JSONResponse:
-    """Dispatch a solve request to the type-specific solver."""
-    t0 = time.monotonic()
-    logger.info("solve type=%s url=%s", req.type, req.site_url)
-
-    # Lazy-import solvers so startup doesn't pay for every module and an
-    # import error in one solver doesn't sink the whole process.
+def _decode_b64_png(data: str, label: str) -> bytes:
     try:
-        if req.type == "recaptcha_v2":
-            from src.solvers.recaptcha_v2 import solve as impl
-            token = await impl(req.site_url, req.site_key or "", req.timeout_s)
-            return JSONResponse(TokenResponse(
-                token=token, elapsed_ms=int((time.monotonic() - t0) * 1000),
-            ).model_dump())
-
-        if req.type == "recaptcha_v3":
-            from src.solvers.recaptcha_v3 import solve as impl
-            token = await impl(req.site_url, req.site_key or "", req.timeout_s)
-            return JSONResponse(TokenResponse(
-                token=token, elapsed_ms=int((time.monotonic() - t0) * 1000),
-            ).model_dump())
-
-        if req.type == "hcaptcha":
-            from src.solvers.hcaptcha import solve as impl
-            token = await impl(req.site_url, req.site_key or "", req.timeout_s)
-            return JSONResponse(TokenResponse(
-                token=token, elapsed_ms=int((time.monotonic() - t0) * 1000),
-            ).model_dump())
-
-        if req.type == "turnstile":
-            from src.solvers.turnstile import solve as impl
-            token = await impl(req.site_url, req.site_key or "", req.timeout_s)
-            return JSONResponse(TokenResponse(
-                token=token, elapsed_ms=int((time.monotonic() - t0) * 1000),
-            ).model_dump())
-
-        if req.type == "cf_managed":
-            from src.solvers.cf_managed import solve as impl
-            cookies, user_agent = await impl(req.site_url, req.timeout_s)
-            return JSONResponse(CookieBundleResponse(
-                cookies=cookies, user_agent=user_agent,
-                elapsed_ms=int((time.monotonic() - t0) * 1000),
-            ).model_dump())
-
-        # Should be unreachable given Literal validation but be explicit.
-        raise HTTPException(status_code=400, detail=f"unknown type: {req.type}")
-    except HTTPException:
-        raise
-    except NotImplementedError as exc:
-        raise HTTPException(status_code=501, detail=str(exc)) from exc
+        return base64.b64decode(data, validate=True)
     except Exception as exc:
-        logger.exception("solve failed for type=%s", req.type)
-        raise HTTPException(status_code=500, detail=f"{type(exc).__name__}: {exc}") from exc
+        raise HTTPException(400, f"{label}: invalid base64 ({exc})") from exc
+
+
+@app.post("/solve_tiles", response_model=SolveTilesResponse)
+async def solve_tiles(req: SolveTilesRequest) -> SolveTilesResponse:
+    t0 = time.monotonic()
+    vlm = get_vlm()
+
+    target = req.target.strip().lower()
+    if req.instruction_image:
+        inst_bytes = _decode_b64_png(req.instruction_image, "instruction_image")
+        try:
+            read_target = await vlm.extract_instruction(inst_bytes)
+        except Exception as exc:
+            logger.warning("extract_instruction failed, falling back to client target: %s", exc)
+            read_target = target
+        if read_target and read_target != target:
+            logger.info("target overridden by instruction_image: %r -> %r", target, read_target)
+            target = read_target
+
+    tiles = [_decode_b64_png(t, f"tile_images[{i}]") for i, t in enumerate(req.tile_images)]
+
+    per_tile_latency: list[int] = [0] * len(tiles)
+
+    async def classify_one(i: int, img: bytes) -> tuple[int, bool]:
+        t_start = time.monotonic()
+        try:
+            hit = await vlm.classify_tile(img, target)
+        except Exception as exc:
+            logger.warning("tile %d classify failed: %s", i, exc)
+            hit = False
+        per_tile_latency[i] = int((time.monotonic() - t_start) * 1000)
+        return i, hit
+
+    results = await asyncio.gather(*[classify_one(i, img) for i, img in enumerate(tiles)])
+    match_indices = sorted(i for i, hit in results if hit)
+
+    total_ms = int((time.monotonic() - t0) * 1000)
+    logger.info(
+        "solve_tiles target=%r tiles=%d matches=%d elapsed_ms=%d",
+        target, len(tiles), len(match_indices), total_ms,
+    )
+    return SolveTilesResponse(
+        match_indices=match_indices,
+        target=target,
+        model_used=vlm.model,
+        per_tile_latency_ms=per_tile_latency,
+        total_elapsed_ms=total_ms,
+    )

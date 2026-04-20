@@ -1,149 +1,145 @@
 ---
 name: captcha-solver
-description: When and how to call the captcha-solver MCP to get past reCAPTCHA v2/v3, hCaptcha (incl. Enterprise), Turnstile, and Cloudflare Managed Challenge. Covers type detection, site-key extraction, token/cookie injection, cost awareness.
-version: 0.1.0
+description: Classifier MCP for reCAPTCHA/hCaptcha tile challenges. You drive your own Camofox browser; this tool takes per-tile screenshots and returns which indices contain the target.
+version: 0.2.0
 author: spawdog
-license: GPL-3.0
+license: MIT
 metadata:
   hermes:
-    tags: [MCP, CAPTCHA, browser, OpenRouter, Cloudflare, hCaptcha, reCAPTCHA]
-    related_skills: [zai-mcp, browser-automation]
+    tags: [MCP, CAPTCHA, browser, Camofox, vision]
+    related_skills: [browser-automation]
 ---
 
 # captcha-solver MCP
 
-You have a dedicated CAPTCHA solver available as `captcha-solver:solve`. It
-runs its own stealth Firefox (Camoufox) in a Docker container and calls a
-strong vision model (OpenRouter Qwen3-VL/Gemma/etc.) to classify tiles. It
-handles the full challenge flow end-to-end and returns either a response
-token or a `cf_clearance` cookie.
+A **tile classifier** — not a full browser-driving solver. The agent (you)
+owns the browser session and orchestrates the challenge. The MCP just takes
+per-tile images and returns which indices match the target.
 
-## When to call it
+This arrangement matters because Hermes and the solver both need to share
+a browser fingerprint for Google/Cloudflare tokens to validate. Since
+Hermes already runs on Camofox, you're the one with the valid session —
+only the vision classification is delegated.
 
-As soon as you detect a CAPTCHA blocking your progress on a page. Don't try to
-screenshot-then-zai-vision yourself — that's minutes per solve; this tool is
-~15-60s.
-
-## How to detect the CAPTCHA type
-
-Inspect the page for one of these signatures:
-
-| Signature | `type` value |
-|---|---|
-| `iframe[src*='www.google.com/recaptcha/api2']` or "I'm not a robot" checkbox | `recaptcha_v2` |
-| `<script src='https://www.google.com/recaptcha/api.js?render=<key>'>` (no visible widget) | `recaptcha_v3` |
-| `iframe[src*='hcaptcha.com']` or `<div class=h-captcha>` | `hcaptcha` |
-| `iframe[src*='challenges.cloudflare.com/turnstile']` or `<div class=cf-turnstile>` | `turnstile` |
-| Full-page CF interstitial with `#challenge-stage` / "Checking your browser before accessing" / "Just a moment…" | `cf_managed` |
-
-## How to extract the site_key
-
-Required for every type except `cf_managed`. Sources (in order of preference):
-
-1. The widget's `data-sitekey` attribute — `div[data-sitekey]` or
-   `div.g-recaptcha[data-sitekey]` / `div.h-captcha[data-sitekey]` /
-   `div.cf-turnstile[data-sitekey]`.
-2. URL params on the loader script — e.g. `render=<key>` on reCAPTCHA v3's
-   `api.js` URL.
-3. Regex match on the page source — reCAPTCHA and Turnstile keys look like
-   `6L...` and hCaptcha / Turnstile keys can look like UUIDs.
-
-## How to call the tool
+## Tool surface
 
 ```
-captcha-solver:solve(
-    type="recaptcha_v2",       # required; one of the 5 above
-    site_url="https://...",    # the full URL of the page hosting the widget
-    site_key="6L...",          # required except for cf_managed
-    timeout_s=180              # optional, default 180, max 600
+captcha-solver:solve_tiles(
+    target: str,                # "crosswalks", "buses", "traffic lights", ...
+    tile_images: [base64-png],  # order matters; we return indices into this list
+    instruction_image: base64-png  # optional; overrides target if supplied
 )
 ```
 
-Returns JSON. Two possible shapes:
-
-- **Token response** (reCAPTCHA/hCaptcha/Turnstile):
-  ```json
-  {"token": "...", "model_used": null, "elapsed_ms": 57500}
-  ```
-- **Cookie bundle** (cf_managed only):
-  ```json
-  {"cookies": {"cf_clearance": "...", "__cf_bm": "..."},
-   "user_agent": "Mozilla/5.0 ...",
-   "elapsed_ms": 12500}
-  ```
-
-## How to inject the result
-
-### Token (reCAPTCHA / hCaptcha / Turnstile)
-
-Response field IDs:
-- reCAPTCHA v2/v3 → `g-recaptcha-response` (hidden textarea)
-- hCaptcha → `h-captcha-response` (hidden textarea)
-- Turnstile → `cf-turnstile-response` (hidden input)
-
-Set the value AND dispatch events so any JS form-validation runs:
-
-```js
-const id = 'g-recaptcha-response';  // or h-captcha-response, cf-turnstile-response
-const el = document.getElementById(id) || document.querySelector(`[name=${id}]`);
-el.value = token;
-el.dispatchEvent(new Event('input',  {bubbles: true}));
-el.dispatchEvent(new Event('change', {bubbles: true}));
+Returns:
+```json
+{
+  "match_indices": [0, 4, 8],
+  "target": "crosswalk",
+  "model_used": "glm-5v-turbo",
+  "per_tile_latency_ms": [1200, 1100, ...],
+  "total_elapsed_ms": 3400
+}
 ```
 
-Then submit the form normally.
+## How to solve reCAPTCHA v2 3×3 / 4×4
 
-### Cookie bundle (cf_managed)
+1. **Navigate to the page.** `browser_navigate(url)`. If the page loads a
+   "I'm not a robot" checkbox, click it to open the challenge. Call
+   `browser_snapshot` again after the modal appears.
 
-This is stricter. The `cf_clearance` cookie is **bound to the exact User-Agent
-that earned it** — you MUST sync your browser's UA before using the cookie.
+2. **Read the instruction.** The snapshot will show something like
+   `heading "Select all images with crosswalks"`. Parse the target word(s)
+   out of it. Or, if parsing is flaky, take a screenshot of the heading
+   element and pass it as `instruction_image` — we'll re-read it.
 
-1. Relaunch your Camoufox context with the returned `user_agent` (pass it as
-   `user_agent=` when creating the context, OR set it via
-   `context.set_extra_http_headers({"User-Agent": ua})`).
-2. Add each cookie to the context: for each `name, value` in `cookies`:
-   `context.add_cookies([{"name": name, "value": value, "domain": "<host>", "path": "/"}])`
-   (use the host from `site_url`).
-3. Navigate to `site_url` — the interstitial should be bypassed for ~30
-   minutes (typical `cf_clearance` TTL).
+3. **Collect per-tile screenshots.** The snapshot lists tiles as
+   interactive refs — typically buttons or images inside a grid role. For
+   each tile ref, call `browser_screenshot_element(ref)` and collect the
+   returned `image_base64` strings in order.
 
-**If the UA doesn't match, CF revokes `cf_clearance` on first use.** Don't
-skip step 1.
+4. **Classify.** Call:
+   ```
+   captcha-solver:solve_tiles(
+       target="crosswalk",
+       tile_images=[b64_0, b64_1, ..., b64_15]
+   )
+   ```
+   You'll get back `match_indices: [0, 3, 7, ...]`.
+
+5. **Click matches.** For each `i` in `match_indices`, call
+   `browser_click(ref=tile_refs[i])`. Keep the local mapping from index
+   to ref — we return indices because we don't see your snapshot.
+
+6. **Handle dynamic 4×4 fade-in.** reCAPTCHA's hard mode fades new tiles
+   into slots you just clicked. After clicking, wait ~1s, take a fresh
+   `browser_snapshot` (tile refs may have been re-numbered), screenshot
+   the tiles you just clicked again, and call `solve_tiles` on just
+   those. Repeat until no more matches (usually 1-3 rounds max).
+
+7. **Submit.** Click the verify button (usually labelled "Verify" or with
+   a checkmark icon). If reCAPTCHA accepts, the modal closes and the
+   `g-recaptcha-response` textarea gets a token. No token injection
+   needed — your browser's session has it.
+
+## How to solve hCaptcha
+
+Similar pattern:
+1. Navigate, click the checkbox, snapshot.
+2. Read the instruction (`"Please click each image containing a bus"`).
+3. Per-tile screenshots + `solve_tiles`.
+4. Click matches, submit.
+
+Spatial-reasoning variants (drag-drop, rotate, point-to-region) are not
+supported by the tile classifier. If you see one of those, surface to the
+user — they're rare on public-use hCaptcha but common on Enterprise.
+
+## Cloudflare Managed Challenge
+
+No tool call needed — Camofox's Firefox fingerprint typically passes CF's
+JS challenge without a click. If a Turnstile widget appears on top,
+`browser_click` the checkbox and wait; the token lands in
+`cf-turnstile-response` on its own.
+
+If CF shows an interactive hCaptcha, follow the hCaptcha flow above.
 
 ## Cost awareness
 
-OpenRouter usage is metered:
-- Free tier: 50 req/day at $0 credit; 1000/day once you've deposited any money.
-- Vision models are token-metered — each CAPTCHA takes ~30-50k input tokens
-  (tile images inlined as base64) + 1-2k output tokens.
-- At free-tier models (Gemma-4-31b): effectively $0/solve.
-- At paid flagships (Qwen3-VL-235B): ~$0.01-0.03/solve.
+Classification uses our own Z.AI Coding-plan subscription (via the
+`X-Title: 4.5V MCP Local` hack documented in the [[Z.AI Vision Hack]]
+buildbook). Per-call cost is effectively zero — it counts against the
+5-hour prompt pool, not a per-token wallet. No OpenRouter credits involved.
 
-Don't call the solver in tight retry loops. If the first solve fails, surface
-the error to the user and let them decide. Two failures in a row almost always
-means the widget isn't on the page (wrong `site_url`) or the site is using a
-variant we don't handle (hCaptcha Enterprise with an unsupported challenge
-type, for instance).
+Still, don't loop: each `solve_tiles` call makes N parallel VLM requests
+with thinking enabled (~2-8s each). A stuck agent retrying 10× wastes the
+pool.
 
 ## Failure modes
 
-- **`501 Not Implemented`** — check if you passed the right `type`. The five
-  supported values are listed above.
-- **`504 TimeoutError`** — solver exhausted `timeout_s` without producing a
-  token. Usually means the widget didn't render on the page, or the selectors
-  changed. Ask the user to verify the `site_url` loads the CAPTCHA visibly.
-- **`500 RuntimeError: could not find or click the reCAPTCHA checkbox`** —
-  no reCAPTCHA widget detected. Re-check the page / site_key.
-- **`429 Rate limit`** from OpenRouter — you're out of free-tier budget.
-  Surface to the user with the exact 429 body so they can deposit credit.
-- **Cookie from cf_managed rejected** — UA sync failed (see above).
+- **`{"error": "no browser session"}` on browser_screenshot_element** —
+  you forgot to `browser_navigate` first, or the ref was from a stale
+  snapshot. Call `browser_snapshot` again.
+- **Empty `match_indices`** — classifier saw no target in any tile. If
+  you're confident at least one has it, try again with
+  `instruction_image` included (the target word may be off).
+- **`model_used` is not `glm-5v-turbo`** — check `CAPTCHA_SOLVER_MODEL`
+  in `~/.hermes/.env`; should be `glm-5v-turbo` or `glm-4.6v`.
+- **CF still blocks after Camofox loads the page** — the IP is flagged.
+  Not recoverable from this tool; user needs to rotate Tailscale exit or
+  wait out the flag.
 
-## Related tools in your stack
+## Quick reference: tile-ref mapping trick
 
-- `zai-vision:*` — image analysis for content the user sends (not CAPTCHAs)
-- `zai-reader:webReader` — fetch URL content as clean markdown after CAPTCHA
-  is past
-- `zai-zread:*` — public GitHub repos
-- The browser toolset (agent-browser / Camoufox you drive directly) is still
-  what you use to navigate to the CAPTCHA page and inject the token after
-  solving.
+Since you're doing `browser_snapshot` → per-tile screenshots → classify →
+click, keep the tile refs in the same order you feed them as
+`tile_images`. Something like:
+
+```python
+tile_refs = ["e12", "e13", "e14", ...]          # from snapshot
+tile_imgs = [b64 for _ in (browser_screenshot_element(r) for r in tile_refs)]
+result = captcha_solver.solve_tiles(target=t, tile_images=tile_imgs)
+for i in result["match_indices"]:
+    browser_click(ref=tile_refs[i])
+```
+
+Indices line up because you kept the order consistent.

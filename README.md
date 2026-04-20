@@ -1,90 +1,102 @@
 # captcha-solver-mcp
 
-Containerized CAPTCHA solver bundled as a Hermes plugin. Handles:
+CAPTCHA tile classifier exposed as a Hermes MCP. The plugin itself does not
+drive a browser — it just takes per-tile images and returns which indices
+contain the target object. Hermes drives its own Camofox browser end-to-end
+using `browser_navigate`, `browser_snapshot`, `browser_screenshot_element`,
+and `browser_click`.
 
-- **reCAPTCHA v2** (vision, image-grid + dynamic 4×4 hard mode)
-- **reCAPTCHA v3** (invisible token harvest via `grecaptcha.execute`)
-- **hCaptcha** (image grid, click-on-X, drag-to-match — custom VLM solver)
-- **Cloudflare Turnstile** (checkbox + auto-pass)
-- **Cloudflare Managed Challenge** (returns `cf_clearance` cookie + UA)
+## Why classifier-only (v0.2 rewrite)
 
-Exposes one MCP tool: `captcha-solver:solve(type, site_url, site_key, timeout_s)`.
+The original design ran its own Camoufox inside the container and handed
+back tokens. Two problems killed that:
+
+1. **Fingerprint mismatch.** Google's "sorry" page rendered differently for
+   the solver's browser than for Hermes's, because they had different TLS
+   fingerprints and cookies. Tokens earned in the solver's session were
+   rejected when Hermes replayed them.
+2. **Session handoff is fragile.** Even with matched UAs and cookies, any
+   header drift caused silent rejection.
+
+The v0.2 design moves the browser into Hermes (now running on Camofox
+via the native provider — see the Hermes Buildbook). The solver shrinks
+to one responsibility: **look at a tile, say yes or no**.
+
+## Tool surface
+
+One MCP tool: `captcha-solver:solve_tiles`.
+
+```
+solve_tiles(
+    target: str,                        # "crosswalks", "buses", ...
+    tile_images: [base64-png],          # order matters
+    instruction_image: base64-png       # optional override
+)
+→ {
+    match_indices: [int],               # 0-based into tile_images
+    target: str,                        # the target we actually classified
+    model_used: str,
+    per_tile_latency_ms: [int],
+    total_elapsed_ms: int,
+}
+```
 
 ## Architecture
 
 ```
-Hermes gateway
+Hermes gateway (admin, systemd user)
+  │
+  │ (1) browser_navigate → Camofox (127.0.0.1:9377)
+  │ (2) browser_snapshot → ref list
+  │ (3) browser_screenshot_element(ref) per tile → PNGs
+  │ (4) captcha-solver:solve_tiles(target, tile_images)
+  ▼
+stdio MCP shim  (src/mcp_shim.py)
+  │ HTTP POST to 127.0.0.1:8899/solve_tiles
+  ▼
+FastAPI tile classifier  (src/server.py)
   │
   ▼
-stdio MCP shim  (src/mcp_shim.py, host-side)
-  │ HTTP POST to 127.0.0.1:8899
-  ▼
-FastAPI dispatcher  (src/server.py, inside Docker)
-  ├─ recaptcha_v2   — screenshot grid, per-tile VLM classify, click, verify
-  ├─ recaptcha_v3   — wait for grecaptcha.execute in main-world, harvest token
-  ├─ hcaptcha       — screenshot challenge iframe, VLM action plan (click
-  │                   points / click tiles / drag), execute, submit, loop
-  ├─ turnstile      — poll cf-turnstile-response; click iframe checkbox if visible
-  └─ cf_managed     — navigate interstitial, poll cf_clearance cookie, return
-                      {cookies, user_agent} (agent must sync UA before reuse)
+VLMClient → Z.AI /paas/v4/chat/completions
+           with X-Title: 4.5V MCP Local   (Coding plan Vision pool)
+           and thinking:{type:"enabled"}
 ```
 
-All solvers share a Camoufox browser session (`src/browser.py`) with stealth
-defaults: `main_world_eval=True` (reach page-script globals), `block_webgl=False`
-(reCAPTCHA's fingerprinting probe stalls without WebGL), `os=linux`.
-
-VLM calls go through `src/vlm_client.py`, which **auto-routes per model id**:
-- GLM models (`glm-*`) → Z.AI `/paas/v4` with the `X-Title: 4.5V MCP Local`
-  header, billed against the **Coding plan's Vision Understanding pool**
-  (zero incremental cost)
-- Other models → OpenRouter `/api/v1`
-
-## Environment
-
-| Variable | Purpose |
-|---|---|
-| `GLM_API_KEY` | Z.AI Coding plan key (required if using GLM models — shared with main Hermes config) |
-| `OPENROUTER_API_KEY` | OpenRouter key (required if not using GLM models) |
-| `CAPTCHA_SOLVER_MODEL` | Primary VLM id (default: `glm-5v-turbo`) |
-| `CAPTCHA_SOLVER_MODEL_FALLBACK` | Fallback on 429/5xx (default: `glm-4.6v`) |
-
-### Model options
-
-| Model | Backend | Billing | Best for |
-|---|---|---|---|
-| **`glm-5v-turbo`** | Z.AI `/paas/v4` | Coding plan pool | **Recommended**: strong vision, handles v2 4×4 hard mode |
-| `glm-4.6v` | Z.AI `/paas/v4` | Coding plan pool | Good fallback; slightly older |
-| `google/gemma-4-31b-it` | OpenRouter free tier | 50/1000 req/day | Budget option; weaker on hard challenges |
-| `qwen/qwen3-vl-32b-instruct` | OpenRouter paid | ~$0.005/solve | Strong general VLM without needing a Z.AI key |
-| `bytedance/ui-tars-1.5-7b` | OpenRouter paid | ~$0.004/solve | Computer-use-tuned; useful for action-planning hCaptcha variants |
-
-### The Z.AI unlock explained
+## The Z.AI unlock
 
 Direct `/paas/v4/chat/completions` with `glm-5v-turbo` normally returns
-`1113 Insufficient balance` for Coding-plan-only keys. The Z.AI MCP server
-(`@z_ai/mcp-server`) succeeds on the same endpoint because it sends:
+`1113 Insufficient balance` for Coding-plan-only keys. `@z_ai/mcp-server`
+succeeds because it sends:
 
 ```
 X-Title: 4.5V MCP Local
 Accept-Language: en-US,en
 ```
 
-With that header, the same call routes through the **Vision Understanding**
-tier of the Coding plan — the same 5-hour prompt pool the rest of your Z.AI
-stack uses. `vlm_client.py` adds this header automatically for any model id
-starting with `glm-`.
+That routes the call through the **Coding plan's Vision Understanding
+pool** (shared 5-hour prompt budget) instead of per-token billing.
+`vlm_client.py` adds those headers on every call. Details in the
+[[Z.AI Vision Hack]] buildbook page.
 
-## Install (standalone)
+## Environment
+
+| Variable | Purpose |
+|---|---|
+| `GLM_API_KEY` | Z.AI Coding-plan key (shared with the rest of Hermes's GLM config) |
+| `CAPTCHA_SOLVER_MODEL` | VLM id — default `glm-5v-turbo`; `glm-4.6v` also works |
+
+No OpenRouter, no fallback chain — one subscription, one billing path. If
+Z.AI goes down, the solver errors; that's explicit and acceptable.
+
+## Install (standalone disaster-recovery path)
 
 ```sh
 git clone https://github.com/atebites-hub/captcha-solver-mcp.git \
   ~/.hermes/plugins/captcha-solver-mcp
 
 cat >> ~/.hermes/.env <<EOF
-# Either GLM key (recommended — no extra billing) OR OpenRouter key
 GLM_API_KEY=<your Z.AI Coding plan key>
 CAPTCHA_SOLVER_MODEL=glm-5v-turbo
-CAPTCHA_SOLVER_MODEL_FALLBACK=glm-4.6v
 EOF
 chmod 600 ~/.hermes/.env
 
@@ -92,9 +104,10 @@ chmod 600 ~/.hermes/.env
 systemctl --user restart hermes-gateway.service
 ```
 
-Installer is idempotent — safe to re-run. Builds Docker image, waits for
-`/health`, merges MCP entry into `~/.hermes/config.yaml`, symlinks SKILL.md
-into Hermes's skills tree for auto-discovery.
+Installer is idempotent. It builds the Docker image (~200 MB — Python +
+FastAPI only, no Camoufox), waits for `/health`, merges the MCP entry
+into `~/.hermes/config.yaml`, and symlinks SKILL.md into the Hermes
+skills tree for auto-discovery.
 
 ## Uninstall
 
@@ -103,54 +116,29 @@ into Hermes's skills tree for auto-discovery.
 systemctl --user restart hermes-gateway.service
 ```
 
-## Testing
+## Manual test
 
 ```sh
-~/.hermes/plugins/captcha-solver-mcp/test.sh
-```
+# /health
+curl -s http://127.0.0.1:8899/health
 
-Runs smoke tests for each CAPTCHA type against public demo sites.
-
-Manual single test:
-
-```sh
-curl -X POST http://127.0.0.1:8899/solve \
+# solve_tiles (need a real PNG; use cat file.png | base64 -w0)
+curl -sX POST http://127.0.0.1:8899/solve_tiles \
   -H 'Content-Type: application/json' \
-  -d '{"type":"recaptcha_v2","site_url":"https://2captcha.com/demo/recaptcha-v2","site_key":"6LfD3PIbAAAAAJs_eEHvoOl75_83eXSqpPSRFJ_u","timeout_s":270}'
+  -d "$(jq -n --arg b64 "$(base64 -w0 tile.png)" '{target:"car",tile_images:[$b64]}')"
 ```
-
-## Verification status (2026-04-20)
-
-| Type | Target | Result |
-|---|---|---|
-| reCAPTCHA v3 | 2captcha.com | ✅ 5/5 trials, ~8s each |
-| cf_managed | nowsecure.nl | ✅ 3.7s, `cf_clearance` cookie + UA |
-| Turnstile fast-path | demo.turnstile.workers.dev | ✅ 5s |
-| hCaptcha | democaptcha.com | ✅ works (multi-page handled) |
-| reCAPTCHA v2 (glm-5v-turbo) | 2captcha.com | ✅ first-trial solve in 40s |
 
 ## Known limitations
 
-- **IP cohesion**: `cf_clearance` cookies bind the solver container's egress IP.
-  Solver and agent must share egress (same VPS). Running solver on a different
-  host breaks strict-fingerprint sites (Cloudflare especially).
-- **UA sync (cf_managed)**: agent MUST use the returned `user_agent` before
-  injecting `cf_clearance`, or CF revokes the cookie.
-- **Model accuracy**: free Gemma-4-31B struggles on 4×4 hard mode. Upgrade to
-  `glm-5v-turbo` (Coding plan, no extra cost) or `qwen/qwen3-vl-32b` (paid,
-  $0.005/solve) for reliable v2 solves.
-- **No per-hour spend cap** in v0.1.0. A runaway agent could drain OpenRouter
-  credit. Future work: add a budget guard in `vlm_client.py`.
+- **Only tile-classification CAPTCHAs** — reCAPTCHA v2 image grids, hCaptcha
+  image grids. Spatial-reasoning (drag, rotate, point) variants are out of
+  scope for this classifier; the agent should surface those to the user.
+- **Accuracy ceiling is whatever glm-5v-turbo can do** with thinking on.
+  Measured ~85-90% on reCAPTCHA v2 crosswalks; drops on Enterprise hCaptcha.
+- **No per-hour budget cap** — if the agent loops, it just eats the
+  5-hour prompt pool faster. Mitigate by keeping `max_turns` reasonable.
 
 ## Licensing
 
-**MIT.** All runtime dependencies are MIT / Apache 2.0 / MPL-2.0 / source-
-available. No copyleft contamination — hCaptcha solving is in-house, not via
-`hcaptcha-challenger`. See `src/LICENSES/NOTICE` for full attribution.
-
-## References
-
-- [aydinnyunus/ai-captcha-bypass](https://github.com/aydinnyunus/ai-captcha-bypass) — reCAPTCHA v2 flow reference
-- [daijro/camoufox](https://github.com/daijro/camoufox) — stealth Firefox
-- [@z_ai/mcp-server](https://www.npmjs.com/package/@z_ai/mcp-server) — source of the X-Title Vision Understanding unlock
-- [OpenRouter](https://openrouter.ai/) — pluggable non-GLM VLM endpoint
+MIT. Runtime deps (FastAPI, httpx, openai, mcp, Pillow-not-used-anymore):
+all permissive.

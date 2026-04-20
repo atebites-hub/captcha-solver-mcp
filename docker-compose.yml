@@ -11,16 +11,11 @@ services:
     - /home/admin/.hermes/.env
     environment:
       PYTHONPATH: /app
-    volumes:
-    - camoufox-cache:/root/.cache/camoufox
     restart: unless-stopped
-    mem_limit: 2g
+    mem_limit: 512m
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8899/health', timeout=2).read()"]
       interval: 30s
       timeout: 5s
       retries: 3
-      start_period: 30s
-
-volumes:
-  camoufox-cache: {}
+      start_period: 10s

@@ -11,14 +11,5 @@ openai>=1.50
 # Data validation
 pydantic>=2.9
 
-# Stealth browser
-camoufox[geoip]>=0.4
-
 # MCP SDK (host-side shim)
 mcp>=1.2
-
-# Image handling (tile screenshots, upscaling for better VLM accuracy)
-Pillow>=10.4
-
-# YAML reading for config files
-PyYAML>=6.0

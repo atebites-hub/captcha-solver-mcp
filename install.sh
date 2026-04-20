@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # captcha-solver-mcp installer. Safe to re-run.
 #
-# 1. Sanity-check env vars
-# 2. Verify CAPTCHA_SOLVER_MODEL is live on OpenRouter
+# 1. Sanity-check env (GLM_API_KEY required; CAPTCHA_SOLVER_MODEL defaults to glm-5v-turbo)
+# 2. Smoke-test Z.AI /paas/v4 + X-Title Vision Understanding unlock
 # 3. Build + up the docker container (`docker compose up -d --build`)
 # 4. Wait for the FastAPI /health endpoint
 # 5. Merge mcp-servers.yaml into ~/.hermes/config.yaml (Python yaml-merge)

@@ -1,16 +1,14 @@
 name: captcha-solver-mcp
-version: 0.1.0
+version: 0.2.0
 description: |
-  Containerized CAPTCHA solver wired into Hermes as an MCP. Handles reCAPTCHA v2,
-  reCAPTCHA v3, hCaptcha (public + Enterprise), Cloudflare Turnstile, and
-  Cloudflare Managed Challenge. Runs its own Camoufox (stealth Firefox) browser
-  internally and calls a strong vision model on OpenRouter (Qwen3-VL-235B by
-  default). Returns either a response token (reCAPTCHA/hCaptcha/Turnstile) or
-  cf_clearance cookie + user-agent (CF Managed Challenge).
+  CAPTCHA tile classifier exposed as a Hermes MCP. Takes per-tile screenshots
+  plus a target ("crosswalks", "buses", ...) and returns which tile indices
+  contain the target. Backed by Z.AI glm-5v-turbo (Coding-plan Vision
+  Understanding pool — zero incremental cost via the X-Title hack).
 
-  Built to replace the agent-driven "screenshot + zai-vision loop" path, which
-  is functional but takes minutes per solve. This solver completes a reCAPTCHA
-  v2 in ~15-30s.
+  The agent drives its own Camofox browser end-to-end; this plugin only does
+  vision classification. See skills/captcha-solver/SKILL.md for the agent-side
+  workflow (snapshot → per-tile screenshots → classify → click).
 entrypoint: __init__.py
 author: spawdog
 license: MIT
